@@ -5,15 +5,28 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+import random
+from torch.utils.data import random_split
 
-# ---------- Helper to show images ----------
+# ---------- Set Seed for Reproducibility ---------- #
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+# ---------- Helper to show images ---------- #
 def imshow(img):
-    img = img / 2 + 0.5  # unnormalize from [-1,1] to [0,1]
+    img = img / 2 + 0.5  # unnormalize
     npimg = img.numpy()
-    plt.imshow(np.transpose(npimg, (1,2,0)))
+    plt.imshow(np.transpose(npimg, (1, 2, 0)))
+    plt.axis('off')
     plt.show()
 
-# ---------- Define CNN model ----------
+# ---------- Define CNN Model ---------- #
 class SimpleCNN(nn.Module):
     def __init__(self):
         super(SimpleCNN, self).__init__()
@@ -31,34 +44,43 @@ class SimpleCNN(nn.Module):
         x = self.fc2(x)
         return x
 
-# ---------- Main function ----------
+# ---------- Main Function ---------- #
 def main():
-    # ---------- Config ----------
+    set_seed(42)
+    
+    # ---------- Config ---------- #
     BATCH_SIZE = 64
+    EPOCHS = 5
     DATA_DIR = '.'
 
-    # ---------- Transforms ----------
+    # ---------- Transformations ---------- #
     transform = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
     ])
 
-    # ---------- Load datasets ----------
-    trainset = torchvision.datasets.CIFAR10(root=DATA_DIR, train=True, download=False, transform=transform)
+    # ---------- Load Dataset ---------- #
+    full_trainset = torchvision.datasets.CIFAR10(root=DATA_DIR, train=True, download=False, transform=transform)
     testset = torchvision.datasets.CIFAR10(root=DATA_DIR, train=False, download=False, transform=transform)
+    
+    train_size = int(0.8 * len(full_trainset))
+    val_size = len(full_trainset) - train_size
+    trainset, valset = random_split(full_trainset, [train_size, val_size])
 
-    trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
-    testloader = torch.utils.data.DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2)
+    pin_memory = torch.cuda.is_available()
+    trainloader = torch.utils.data.DataLoader(trainset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=pin_memory)
+    valloader = torch.utils.data.DataLoader(valset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=pin_memory)
+    testloader = torch.utils.data.DataLoader(testset, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=pin_memory)
 
-    classes = trainset.classes
+    classes = full_trainset.classes
 
-    # ---------- Visualize some data ----------
+    # ---------- Visualize Sample Data ---------- #
     images, labels = next(iter(trainloader))
     print("Sample batch shape:", images.shape)
     imshow(torchvision.utils.make_grid(images[:8]))
     print(' '.join(f'{classes[labels[j]]}' for j in range(8)))
 
-    # ---------- Setup device and model ----------
+    # ---------- Setup Device & Model ---------- #
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
@@ -66,12 +88,18 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
 
-    # ---------- Training loop ----------
-    for epoch in range(5):
-        running_loss = 0.0
-        for i, (inputs, labels) in enumerate(trainloader):
-            inputs, labels = inputs.to(device), labels.to(device)
+    # ---------- Training Loop ---------- #
+    train_losses, val_losses = [], []
+    train_accuracies, val_accuracies = [], []
 
+    for epoch in range(EPOCHS):
+        net.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+
+        for inputs, labels in trainloader:
+            inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
             outputs = net(inputs)
             loss = criterion(outputs, labels)
@@ -79,37 +107,70 @@ def main():
             optimizer.step()
 
             running_loss += loss.item()
-            if i % 100 == 99:
-                print(f"[{epoch+1}, {i+1:5d}] loss: {running_loss / 100:.3f}")
-                running_loss = 0.0
-    print("Finished Training")
-
-    # ---------- Quick evaluation ----------
-    dataiter = iter(testloader)
-    images, labels = next(dataiter)
-    images, labels = images.to(device), labels.to(device)
-
-    outputs = net(images)
-    _, predicted = torch.max(outputs, 1)
-
-    print("Predicted:", ' '.join(f'{classes[predicted[j]]}' for j in range(8)))
-    print("Actual:   ", ' '.join(f'{classes[labels[j]]}' for j in range(8)))
-    imshow(torchvision.utils.make_grid(images[:8].cpu()))
-
-    # ---------- Evaluate on the whole test set ----------
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for data in testloader:
-            images, labels = data
-            images, labels = images.to(device), labels.to(device)
-            outputs = net(images)
-            _, predicted = torch.max(outputs.data, 1)
+            _, predicted = torch.max(outputs, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
-    print(f"Accuracy on the 10000 test images: {100 * correct / total:.2f}%")
+        train_losses.append(running_loss / len(trainloader))
+        train_accuracies.append(100 * correct / total)
 
-# ---------- Windows-safe launch ----------
+        # ---------- Validation Evaluation ---------- #
+        net.eval()
+        val_loss = 0.0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for inputs, labels in valloader:
+                inputs, labels = inputs.to(device), labels.to(device)
+                outputs = net(inputs)
+                loss = criterion(outputs, labels)
+                val_loss += loss.item()
+                _, predicted = torch.max(outputs, 1)
+                total += labels.size(0)
+                correct += (predicted == labels).sum().item()
+
+        val_losses.append(val_loss / len(valloader))
+        val_accuracies.append(100 * correct / total)
+
+        print(f"Epoch {epoch+1}: Train Loss = {train_losses[-1]:.3f}, Train Acc = {train_accuracies[-1]:.2f}% | "
+              f"Val Loss = {val_losses[-1]:.3f}, Val Acc = {val_accuracies[-1]:.2f}%")
+
+    # ---------- Final Evaluation on Test Set ---------- #
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for inputs, labels in testloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = net(inputs)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+
+    print(f"Test Accuracy on 10000 images: {100 * correct / total:.2f}%")
+
+    # ---------- Plot Training vs Validation ---------- #
+    epochs = range(1, EPOCHS + 1)
+    plt.figure(figsize=(12, 5))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, label="Train Loss")
+    plt.plot(epochs, val_losses, label="Validation Loss")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss Over Epochs")
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, train_accuracies, label="Train Accuracy")
+    plt.plot(epochs, val_accuracies, label="Validation Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Accuracy Over Epochs")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+# ---------- Entry ---------- #
 if __name__ == "__main__":
     main()
